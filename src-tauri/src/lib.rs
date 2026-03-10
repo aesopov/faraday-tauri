@@ -5,6 +5,10 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 
+#[cfg(unix)]
+mod elevate;
+#[cfg(not(unix))]
+#[path = "elevate_stub.rs"]
 mod elevate;
 
 // ── Serializable types for Tauri IPC ─────────────────────────────────

@@ -152,10 +152,10 @@ impl Default for FdTable {
 impl Drop for FdTable {
     fn drop(&mut self) {
         let map = self.map.get_mut();
-        for &fd in map.keys() {
+        for &_fd in map.keys() {
             #[cfg(unix)]
             unsafe {
-                libc::close(fd);
+                libc::close(_fd);
             }
         }
     }
@@ -347,13 +347,13 @@ pub fn pread(fd: i32, offset: u64, length: usize, fdt: &FdTable) -> Result<Vec<u
 pub fn pread(fd: i32, offset: u64, length: usize, fdt: &FdTable) -> Result<Vec<u8>, FsError> {
     // Windows: use SetFilePointerEx + ReadFile
     // For now, use Rust's File abstraction
+    use std::io::{Read, Seek};
     use std::os::windows::io::FromRawHandle;
     if !fdt.contains(fd as i64) {
         return Err(FsError::BadFd);
     }
     let handle = fd as *mut std::ffi::c_void;
     let file = unsafe { fs::File::from_raw_handle(handle) };
-    use std::io::Seek;
     let mut file = std::io::BufReader::new(file);
     file.seek(std::io::SeekFrom::Start(offset))
         .map_err(FsError::from_io)?;

@@ -1,0 +1,346 @@
+// Headless Faraday server — HTTP static files + WebSocket FS over JSON-RPC 2.0.
+//
+// Uses faraday-core for all filesystem operations (same as the Tauri app).
+// Each WebSocket connection gets its own FdTable and FsWatcher.
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use faraday_core::{
+    error::FsError,
+    ops::{self, FdTable},
+    watch::{EventCallback, FsWatcher},
+};
+use futures::{SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::mpsc;
+use tower_http::services::{ServeDir, ServeFile};
+
+// ── JSON entry for the wire ─────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsEntry {
+    name: String,
+    kind: String,
+    size: f64,
+    mtime_ms: f64,
+    mode: u32,
+    nlink: u32,
+    hidden: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_target: Option<String>,
+}
+
+impl From<ops::EntryInfo> for JsEntry {
+    fn from(e: ops::EntryInfo) -> Self {
+        Self {
+            name: e.name,
+            kind: e.kind.as_str().to_string(),
+            size: e.size,
+            mtime_ms: e.mtime_ms,
+            mode: e.mode,
+            nlink: e.nlink,
+            hidden: e.hidden,
+            link_target: e.link_target,
+        }
+    }
+}
+
+// ── Shared server config ────────────────────────────────────────────
+
+#[derive(Clone)]
+struct AppState {
+    icons_dir: Arc<Option<String>>,
+}
+
+// ── Per-connection session ──────────────────────────────────────────
+
+struct Session {
+    fdt: FdTable,
+    watcher: FsWatcher,
+    icons_dir: Option<String>,
+}
+
+// ── WebSocket handler ───────────────────────────────────────────────
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut sink, mut stream) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    // Per-connection watch callback → JSON-RPC notifications
+    let tx_watch = tx.clone();
+    let cb: EventCallback = Arc::new(move |watch_id, kind, name| {
+        let n = json!({
+            "jsonrpc": "2.0",
+            "method": "fs.change",
+            "params": { "watchId": watch_id, "type": kind.as_str(), "name": name }
+        });
+        let _ = tx_watch.send(Message::Text(n.to_string()));
+    });
+
+    let watcher = match FsWatcher::new(cb) {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    let session = Arc::new(Session {
+        fdt: FdTable::new(),
+        watcher,
+        icons_dir: state.icons_dir.as_ref().clone(),
+    });
+
+    // Writer: channel → WebSocket
+    let write_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Reader: WebSocket → dispatch
+    while let Some(Ok(msg)) = stream.next().await {
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let session = session.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Some(response) = process_message(&session, &text).await {
+                let _ = tx.send(response);
+            }
+        });
+    }
+
+    drop(tx);
+    let _ = write_task.await;
+    // Session drops here → FdTable closes all fds, FsWatcher stops
+}
+
+// ── RPC dispatch ────────────────────────────────────────────────────
+
+async fn process_message(session: &Arc<Session>, text: &str) -> Option<Message> {
+    let msg: Value = serde_json::from_str(text).ok()?;
+    let id = msg.get("id")?.clone();
+    let method = msg["method"].as_str()?.to_string();
+    let params = msg["params"].clone();
+
+    // fs.read → binary frame response
+    if method == "fs.read" {
+        let fd = params["handle"].as_i64()? as i32;
+        let offset = params["offset"].as_u64()?;
+        let length = params["length"].as_u64()? as usize;
+        let id_num = id.as_u64()? as u32;
+
+        let session = session.clone();
+        let data =
+            tokio::task::spawn_blocking(move || ops::pread(fd, offset, length, &session.fdt))
+                .await
+                .unwrap();
+
+        return Some(match data {
+            Ok(bytes) => {
+                let mut frame = Vec::with_capacity(4 + bytes.len());
+                frame.extend_from_slice(&id_num.to_le_bytes());
+                frame.extend_from_slice(&bytes);
+                Message::Binary(frame)
+            }
+            Err(e) => rpc_error(&id, &e),
+        });
+    }
+
+    let session = session.clone();
+    let result = tokio::task::spawn_blocking(move || dispatch(&session, &method, &params))
+        .await
+        .unwrap();
+
+    Some(match result {
+        Ok(value) => Message::Text(
+            json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string(),
+        ),
+        Err(e) => rpc_error(&id, &e),
+    })
+}
+
+fn rpc_error(id: &Value, e: &FsError) -> Message {
+    Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -1, "message": e.to_string(), "data": { "errno": e.errno_str() } }
+        })
+        .to_string(),
+    )
+}
+
+fn dispatch(session: &Session, method: &str, params: &Value) -> Result<Value, FsError> {
+    match method {
+        "fs.entries" => {
+            let path = params["path"].as_str().ok_or(FsError::InvalidInput)?;
+            let entries: Vec<JsEntry> = ops::entries(path)?.into_iter().map(Into::into).collect();
+            Ok(serde_json::to_value(entries).unwrap())
+        }
+        "fs.stat" => {
+            let path = params["path"].as_str().ok_or(FsError::InvalidInput)?;
+            let s = ops::stat(path)?;
+            Ok(json!({ "size": s.size, "mtimeMs": s.mtime_ms }))
+        }
+        "fs.exists" => {
+            let path = params["path"].as_str().ok_or(FsError::InvalidInput)?;
+            Ok(json!(ops::exists(path)))
+        }
+        "fs.open" => {
+            let path = params["path"].as_str().ok_or(FsError::InvalidInput)?;
+            Ok(json!(ops::open(path, &session.fdt)?))
+        }
+        "fs.close" => {
+            let fd = params["handle"].as_i64().ok_or(FsError::InvalidInput)? as i32;
+            ops::close(fd, &session.fdt);
+            Ok(Value::Null)
+        }
+        "fs.watch" => {
+            let watch_id = params["watchId"].as_str().ok_or(FsError::InvalidInput)?;
+            let path = params["path"].as_str().ok_or(FsError::InvalidInput)?;
+            Ok(json!(session.watcher.add(watch_id, path)))
+        }
+        "fs.unwatch" => {
+            let watch_id = params["watchId"].as_str().ok_or(FsError::InvalidInput)?;
+            session.watcher.remove(watch_id);
+            Ok(Value::Null)
+        }
+        "utils.getHomePath" => Ok(json!(
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )),
+        "utils.getIconsPath" => Ok(json!(session.icons_dir.as_deref().unwrap_or(""))),
+        _ => Err(FsError::InvalidInput),
+    }
+}
+
+// ── CLI config ──────────────────────────────────────────────────────
+
+struct Config {
+    port: u16,
+    host: String,
+    static_dir: Option<String>,
+    icons_dir: Option<String>,
+}
+
+fn parse_config() -> Config {
+    let args: Vec<String> = std::env::args().collect();
+    let mut port: u16 = std::env::var("FARADAY_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3001);
+    let mut host = std::env::var("FARADAY_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let mut static_dir: Option<String> = None;
+    let mut icons_dir: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" if i + 1 < args.len() => {
+                if let Ok(p) = args[i + 1].parse() {
+                    port = p;
+                }
+                i += 2;
+            }
+            "--host" if i + 1 < args.len() => {
+                host = args[i + 1].clone();
+                i += 2;
+            }
+            "--static-dir" if i + 1 < args.len() => {
+                static_dir = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--icons-dir" if i + 1 < args.len() => {
+                icons_dir = std::fs::canonicalize(&args[i + 1])
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| Some(args[i + 1].clone()));
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    // Auto-detect static dir
+    if static_dir.is_none() {
+        for c in ["dist-web", "../dist-web"] {
+            if PathBuf::from(c).join("index.html").exists() {
+                static_dir = Some(c.into());
+                break;
+            }
+        }
+    }
+
+    // Auto-detect icons dir
+    if icons_dir.is_none() {
+        for c in ["src-tauri/icons-bundle", "icons-bundle", "icons"] {
+            if PathBuf::from(c).exists() {
+                if let Ok(p) = std::fs::canonicalize(c) {
+                    icons_dir = Some(p.to_string_lossy().into_owned());
+                }
+                break;
+            }
+        }
+    }
+
+    Config {
+        port,
+        host,
+        static_dir,
+        icons_dir,
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let config = parse_config();
+    let state = AppState {
+        icons_dir: Arc::new(config.icons_dir),
+    };
+
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(state);
+
+    let app = if let Some(ref dir) = config.static_dir {
+        let index = PathBuf::from(dir).join("index.html");
+        if index.exists() {
+            eprintln!("Serving web UI from {dir}");
+            app.fallback_service(
+                ServeDir::new(dir).not_found_service(ServeFile::new(index)),
+            )
+        } else {
+            app
+        }
+    } else {
+        app
+    };
+
+    let addr = format!("{}:{}", config.host, config.port);
+    eprintln!("Faraday server listening on http://{addr}");
+    eprintln!("WebSocket endpoint: ws://{addr}/ws");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}

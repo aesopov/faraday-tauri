@@ -6,7 +6,7 @@ authors = ["Mikhail Isupov"]
 edition = "2021"
 
 [workspace]
-members = ["faraday-core", "frdye"]
+members = ["faraday-core", "frdye", "faraday-server"]
 
 [lib]
 name = "faraday_tauri_lib"

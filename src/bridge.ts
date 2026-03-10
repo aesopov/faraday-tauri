@@ -1,102 +1,41 @@
-/// Tauri IPC bridge — replaces window.electron from the Electron version.
+/// Dynamic bridge provider — detects Tauri vs browser and loads the right backend.
 ///
-/// Provides the same interface so renderer components need minimal changes.
-/// Uses Tauri's invoke() for commands and listen() for events.
-import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+/// Uses ES module live bindings: importers of `bridge` always see the current value.
+/// Must call `initBridge()` before rendering (from main.tsx).
 import type { FsaRawEntry, FsChangeEvent } from './types';
 
-// Rust returns snake_case fields — map to camelCase
-interface RustFsEntry {
-  name: string;
-  kind: string;
-  size: number;
-  mtime_ms: number;
-  mode: number;
-  nlink: number;
-  hidden: boolean;
-  link_target: string | null;
-}
-
-interface RustFsChangeEvent {
-  watch_id: string;
-  kind: string;
-  name: string | null;
-}
-
-function mapEntry(e: RustFsEntry): FsaRawEntry {
-  return {
-    name: e.name,
-    kind: e.kind as FsaRawEntry['kind'],
-    size: e.size,
-    mtimeMs: e.mtime_ms,
-    mode: e.mode,
-    nlink: e.nlink,
-    hidden: e.hidden,
-    linkTarget: e.link_target ?? undefined,
+export interface Bridge {
+  fsa: {
+    entries(dirPath: string): Promise<FsaRawEntry[]>;
+    stat(filePath: string): Promise<{ size: number; mtimeMs: number }>;
+    exists(filePath: string): Promise<boolean>;
+    open(filePath: string): Promise<number>;
+    read(fd: number, offset: number, length: number): Promise<ArrayBuffer>;
+    close(fd: number): Promise<void>;
+    watch(watchId: string, dirPath: string): Promise<boolean>;
+    unwatch(watchId: string): Promise<void>;
+    onFsChange(callback: (event: FsChangeEvent) => void): () => void;
+  };
+  utils: {
+    getHomePath(): Promise<string>;
+    getIconsPath(): Promise<string>;
+  };
+  theme: {
+    get(): Promise<string>;
+    onChange(callback: (theme: string) => void): () => void;
   };
 }
 
-export const bridge = {
-  fsa: {
-    async entries(dirPath: string): Promise<FsaRawEntry[]> {
-      const raw = await invoke<RustFsEntry[]>('fsa_entries', { dirPath });
-      return raw.map(mapEntry);
-    },
-    async stat(filePath: string): Promise<{ size: number; mtimeMs: number }> {
-      const raw = await invoke<{ size: number; mtime_ms: number }>('fsa_stat', { filePath });
-      return { size: raw.size, mtimeMs: raw.mtime_ms };
-    },
-    async exists(filePath: string): Promise<boolean> {
-      return invoke<boolean>('fsa_exists', { filePath });
-    },
-    async open(filePath: string): Promise<number> {
-      return invoke<number>('fsa_open', { filePath });
-    },
-    async read(fd: number, offset: number, length: number): Promise<ArrayBuffer> {
-      const bytes = await invoke<number[]>('fsa_read', { fd, offset, length });
-      return new Uint8Array(bytes).buffer;
-    },
-    async close(fd: number): Promise<void> {
-      return invoke<void>('fsa_close', { fd });
-    },
-    async watch(watchId: string, dirPath: string): Promise<boolean> {
-      return invoke<boolean>('fsa_watch', { watchId, dirPath });
-    },
-    async unwatch(watchId: string): Promise<void> {
-      return invoke<void>('fsa_unwatch', { watchId });
-    },
-    onFsChange(callback: (event: FsChangeEvent) => void): () => void {
-      let unlisten: UnlistenFn | null = null;
-      listen<RustFsChangeEvent>('fsa:change', (event) => {
-        callback({
-          watchId: event.payload.watch_id,
-          type: event.payload.kind as FsChangeEvent['type'],
-          name: event.payload.name,
-        });
-      }).then((fn) => { unlisten = fn; });
-      return () => { unlisten?.(); };
-    },
-  },
-  utils: {
-    async getHomePath(): Promise<string> {
-      return invoke<string>('get_home_path');
-    },
-    async getIconsPath(): Promise<string> {
-      return invoke<string>('get_icons_path');
-    },
-  },
-  theme: {
-    async get(): Promise<string> {
-      return invoke<string>('get_theme');
-    },
-    onChange(callback: (theme: string) => void): () => void {
-      // Tauri v2 doesn't have a native theme change event yet.
-      // Use CSS prefers-color-scheme media query listener instead.
-      const mq = window.matchMedia('(prefers-color-scheme: dark)');
-      const handler = (e: MediaQueryListEvent) => callback(e.matches ? 'dark' : 'light');
-      mq.addEventListener('change', handler);
-      return () => mq.removeEventListener('change', handler);
-    },
-  },
-};
+// Live-binding: fsa.ts and iconCache.ts import `bridge` and always get the current value.
+// eslint-disable-next-line import/no-mutable-exports
+export let bridge: Bridge;
+
+export async function initBridge(): Promise<void> {
+  if ('__TAURI_INTERNALS__' in window) {
+    const { tauriBridge } = await import('./tauriBridge');
+    bridge = tauriBridge;
+  } else {
+    const { createWsBridge } = await import('./wsBridge');
+    bridge = await createWsBridge(`ws://${location.host}/ws`);
+  }
+}

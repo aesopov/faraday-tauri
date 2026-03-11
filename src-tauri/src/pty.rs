@@ -70,6 +70,7 @@ pub fn spawn(cwd: &str, cols: u16, rows: u16) -> io::Result<PtyHandle> {
         Command::new(&shell)
             .current_dir(cwd)
             .env("TERM", "xterm-256color")
+            .env("HISTCONTROL", "ignoreboth")
             .stdin(Stdio::from_raw_fd(slave_fd))
             .stdout(Stdio::from_raw_fd(slave_out))
             .stderr(Stdio::from_raw_fd(slave_err))
@@ -80,6 +81,26 @@ pub fn spawn(cwd: &str, cols: u16, rows: u16) -> io::Result<PtyHandle> {
             })
             .spawn()?
     };
+
+    // Write shell init: set up OSC 7 cwd reporting + history-ignore-space
+    let shell_basename = std::path::Path::new(&shell)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let init = match shell_basename.as_str() {
+        "bash" => Some(
+            r#" __frd(){ printf '\e]7;file://localhost%s\e\\' "$PWD";}; PROMPT_COMMAND="__frd;${PROMPT_COMMAND}"; clear"#,
+        ),
+        "zsh" => Some(
+            r#" setopt HIST_IGNORE_SPACE; __frd(){ printf '\e]7;file://localhost%s\e\\' "$PWD";}; precmd_functions+=(__frd); clear"#,
+        ),
+        _ => None,
+    };
+    if let Some(cmd) = init {
+        let line = format!("{}\n", cmd);
+        let _ = write_all(master, line.as_bytes());
+    }
 
     Ok(PtyHandle { master_fd: master, child })
 }

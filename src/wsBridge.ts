@@ -2,6 +2,7 @@
 ///
 /// Implements the same Bridge interface as tauriBridge.ts, using JSON-RPC 2.0
 /// over WebSocket. Binary frames are used for fs.read responses.
+/// Automatically reconnects on disconnection with exponential backoff.
 import type { Bridge } from './bridge';
 import type { FsaRawEntry, FsChangeEvent, FsChangeType } from './types';
 
@@ -16,36 +17,33 @@ type PtyExitCallback = (ptyId: number) => void;
 const BINARY_HEADER_SIZE = 4; // uint32 LE requestId prefix on binary frames
 
 export async function createWsBridge(wsUrl: string): Promise<Bridge> {
-  const ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-
+  let ws: WebSocket;
   let nextId = 0;
   const pending = new Map<number, Pending>();
   const changeListeners = new Set<(event: FsChangeEvent) => void>();
   const ptyDataListeners = new Set<PtyDataCallback>();
   const ptyExitListeners = new Set<PtyExitCallback>();
+  const reconnectCallbacks = new Set<() => void>();
 
-  const connected = new Promise<void>((resolve, reject) => {
-    ws.addEventListener('open', () => resolve(), { once: true });
-    ws.addEventListener('error', () => reject(new Error('WebSocket connection failed')), {
-      once: true,
+  // Connection readiness gate — rpc() awaits this before sending
+  let wsReady: Promise<void>;
+  let resolveReady: () => void = () => {};
+  let reconnectDelay = 1000;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  function newReadyPromise() {
+    wsReady = new Promise((resolve) => {
+      resolveReady = resolve;
     });
-  });
+  }
 
-  ws.addEventListener('message', (event: MessageEvent) => {
+  function handleMessage(event: MessageEvent) {
     if (typeof event.data === 'string') {
       handleText(event.data);
     } else {
       handleBinary(event.data as ArrayBuffer);
     }
-  });
-
-  ws.addEventListener('close', () => {
-    for (const { reject } of pending.values()) {
-      reject(new Error('WebSocket closed'));
-    }
-    pending.clear();
-  });
+  }
 
   function handleText(text: string): void {
     const msg = JSON.parse(text);
@@ -92,8 +90,78 @@ export async function createWsBridge(wsUrl: string): Promise<Bridge> {
     p.resolve(payload);
   }
 
+  function rejectPending() {
+    for (const { reject } of pending.values()) {
+      reject(new Error('WebSocket closed'));
+    }
+    pending.clear();
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+      const timeout = setTimeout(() => {
+        ws.close(); // force close → triggers reconnect
+      }, 5000);
+      rpc('ping', {})
+        .then(() => clearTimeout(timeout))
+        .catch(() => clearTimeout(timeout));
+    }, 30000);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  function connect(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(wsUrl);
+      socket.binaryType = 'arraybuffer';
+      let opened = false;
+
+      socket.addEventListener('open', () => {
+        opened = true;
+        ws = socket;
+        resolve();
+      }, { once: true });
+
+      socket.addEventListener('error', () => {
+        if (!opened) reject(new Error('WebSocket connection failed'));
+      }, { once: true });
+
+      socket.addEventListener('message', handleMessage);
+
+      socket.addEventListener('close', () => {
+        if (!opened) return; // connect() rejection handles this
+        stopHeartbeat();
+        rejectPending();
+        newReadyPromise();
+        reconnect();
+      });
+    });
+  }
+
+  async function reconnect() {
+    while (true) {
+      await new Promise((r) => setTimeout(r, reconnectDelay));
+      try {
+        await connect();
+        reconnectDelay = 1000;
+        resolveReady();
+        startHeartbeat();
+        for (const cb of reconnectCallbacks) cb();
+        return;
+      } catch {
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      }
+    }
+  }
+
   function rpc(method: string, params: Record<string, unknown>): Promise<unknown> {
-    return connected.then(
+    return wsReady.then(
       () =>
         new Promise((resolve, reject) => {
           if (ws.readyState !== WebSocket.OPEN) {
@@ -107,7 +175,11 @@ export async function createWsBridge(wsUrl: string): Promise<Bridge> {
     );
   }
 
-  await connected;
+  // Initial connection
+  newReadyPromise();
+  await connect();
+  resolveReady();
+  startHeartbeat();
 
   return {
     fsa: {
@@ -162,6 +234,10 @@ export async function createWsBridge(wsUrl: string): Promise<Bridge> {
         mq.addEventListener('change', handler);
         return () => mq.removeEventListener('change', handler);
       },
+    },
+    onReconnect(callback: () => void): () => void {
+      reconnectCallbacks.add(callback);
+      return () => { reconnectCallbacks.delete(callback); };
     },
   };
 }

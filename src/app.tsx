@@ -272,6 +272,13 @@ export function App() {
     setViewerFile({ path: filePath, name: fileName, size: fileSize });
   }, []);
 
+  const handleTerminalCwd = useCallback((path: string) => {
+    const panel = activePanel === 'left' ? left : right;
+    if (path !== panel.currentPath) {
+      panel.navigateTo(path);
+    }
+  }, [activePanel, left, right]);
+
   useEffect(() => {
     bridge.theme.get().then((t) => setTheme(t as ThemeKind));
     return bridge.theme.onChange((t) => setTheme(t as ThemeKind));
@@ -281,11 +288,53 @@ export function App() {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
+  const isBrowser = !('__TAURI_INTERNALS__' in window);
+
+  // Initial navigation: use URL path in browser mode, home dir otherwise
   useEffect(() => {
-    bridge.utils.getHomePath().then((home) => {
-      left.navigateTo(home);
-      right.navigateTo(home);
-    });
+    const urlPath = isBrowser ? decodeURIComponent(window.location.pathname) : '';
+    const hasUrlPath = urlPath.length > 1; // not just "/"
+
+    if (hasUrlPath) {
+      bridge.fsa.exists(urlPath).then(async (exists) => {
+        if (exists) {
+          left.navigateTo(urlPath);
+        } else {
+          const parent = await findExistingParent(urlPath);
+          left.navigateTo(parent);
+          showError(`Directory not found: ${urlPath}`);
+        }
+      });
+      bridge.utils.getHomePath().then((home) => right.navigateTo(home));
+    } else {
+      bridge.utils.getHomePath().then((home) => {
+        left.navigateTo(home);
+        right.navigateTo(home);
+      });
+    }
+  }, []);
+
+  // Sync active panel path to URL (browser mode only)
+  const activePath = activePanel === 'left' ? left.currentPath : right.currentPath;
+  useEffect(() => {
+    if (isBrowser && activePath) {
+      history.replaceState(null, '', activePath);
+    }
+  }, [activePath]);
+
+  // Re-navigate both panels on WebSocket reconnect
+  const leftPathRef = useRef(left.currentPath);
+  leftPathRef.current = left.currentPath;
+  const rightPathRef = useRef(right.currentPath);
+  rightPathRef.current = right.currentPath;
+
+  useEffect(() => {
+    if (bridge.onReconnect) {
+      return bridge.onReconnect(() => {
+        left.navigateTo(leftPathRef.current);
+        right.navigateTo(rightPathRef.current);
+      });
+    }
   }, []);
 
   useEffect(() => {
@@ -340,7 +389,7 @@ export function App() {
         </div>
       </div>
       <div className="terminal-panel">
-        <TerminalPanel cwd={activeCwd} />
+        <TerminalPanel cwd={activeCwd} onCwdChange={handleTerminalCwd} />
       </div>
       {viewerFile &&
         (isImageFile(viewerFile.name) ? (

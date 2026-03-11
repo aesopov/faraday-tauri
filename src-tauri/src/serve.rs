@@ -324,6 +324,7 @@ fn dispatch(session: &Session, method: &str, params: &Value) -> Result<Value, Fs
             }
             Ok(Value::Null)
         }
+        "ping" => Ok(Value::Null),
         "utils.getHomePath" => Ok(json!(
             dirs::home_dir()
                 .map(|p| p.to_string_lossy().into_owned())

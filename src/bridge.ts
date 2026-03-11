@@ -32,6 +32,7 @@ export interface Bridge {
     get(): Promise<string>;
     onChange(callback: (theme: string) => void): () => void;
   };
+  onReconnect?(callback: () => void): () => void;
 }
 
 // Live-binding: fsa.ts and iconCache.ts import `bridge` and always get the current value.

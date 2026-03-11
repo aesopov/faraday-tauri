@@ -11,6 +11,7 @@ mod elevate;
 #[path = "elevate_stub.rs"]
 mod elevate;
 
+mod pty;
 pub mod rpc;
 pub mod serve;
 
@@ -110,6 +111,8 @@ pub struct AppState {
     pub watcher: FsWatcher,
     pub proxy: std::sync::Mutex<Option<Arc<elevate::FsProxy>>>,
     pub emit_handle: std::sync::Mutex<Option<tauri::AppHandle>>,
+    pub ptys: std::sync::Mutex<std::collections::HashMap<u32, pty::PtyHandle>>,
+    pub next_pty_id: std::sync::atomic::AtomicU32,
 }
 
 impl AppState {
@@ -220,6 +223,80 @@ fn fsa_unwatch(watch_id: String, state: State<'_, AppState>) {
     }
 }
 
+// ── PTY commands ────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct PtyDataEvent {
+    pty_id: u32,
+    data: String,
+}
+
+#[derive(Serialize, Clone)]
+struct PtyExitEvent {
+    pty_id: u32,
+}
+
+#[tauri::command]
+fn pty_spawn(cwd: String, state: State<'_, AppState>, app_handle: tauri::AppHandle) -> CmdResult<u32> {
+    let id = state.next_pty_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let handle = pty::spawn(&cwd, 80, 24).map_err(|e| CmdError(FsError::Io(e)))?;
+    #[cfg(unix)]
+    let master_fd = handle.master_fd;
+    state.ptys.lock().unwrap().insert(id, handle);
+
+    #[cfg(unix)]
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match pty::read_blocking(master_fd, &mut buf) {
+                Ok(0) | Err(_) => {
+                    let _ = app_handle.emit("pty:exit", PtyExitEvent { pty_id: id });
+                    break;
+                }
+                Ok(n) => {
+                    let data = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let _ = app_handle.emit("pty:data", PtyDataEvent { pty_id: id, data });
+                }
+            }
+        }
+    });
+
+    Ok(id)
+}
+
+#[tauri::command]
+fn pty_write(pty_id: u32, data: String, state: State<'_, AppState>) -> CmdResult<()> {
+    let ptys = state.ptys.lock().unwrap();
+    let handle = ptys.get(&pty_id).ok_or(CmdError(FsError::BadFd))?;
+    #[cfg(unix)]
+    {
+        pty::write_all(handle.master_fd, data.as_bytes()).map_err(|e| CmdError(FsError::Io(e)))?;
+    }
+    #[cfg(not(unix))]
+    { let _ = handle; let _ = data; return Err(CmdError(FsError::Io(std::io::Error::new(std::io::ErrorKind::Unsupported, "PTY not supported")))); }
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_resize(pty_id: u32, cols: u32, rows: u32, state: State<'_, AppState>) -> CmdResult<()> {
+    let ptys = state.ptys.lock().unwrap();
+    let handle = ptys.get(&pty_id).ok_or(CmdError(FsError::BadFd))?;
+    #[cfg(unix)]
+    {
+        pty::resize(handle.master_fd, cols as u16, rows as u16).map_err(|e| CmdError(FsError::Io(e)))?;
+    }
+    #[cfg(not(unix))]
+    { let _ = (handle, cols, rows); return Err(CmdError(FsError::Io(std::io::Error::new(std::io::ErrorKind::Unsupported, "PTY not supported")))); }
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_close(pty_id: u32, state: State<'_, AppState>) {
+    if let Some(mut handle) = state.ptys.lock().unwrap().remove(&pty_id) {
+        pty::close(&mut handle);
+    }
+}
+
 #[tauri::command]
 fn get_icons_path(app_handle: tauri::AppHandle) -> String {
     app_handle
@@ -268,6 +345,8 @@ pub fn run() {
                 watcher,
                 proxy: std::sync::Mutex::new(None),
                 emit_handle: std::sync::Mutex::new(Some(app.handle().clone())),
+                ptys: std::sync::Mutex::new(std::collections::HashMap::new()),
+                next_pty_id: std::sync::atomic::AtomicU32::new(0),
             };
             app.manage(state);
             Ok(())
@@ -284,6 +363,10 @@ pub fn run() {
             get_home_path,
             get_icons_path,
             get_theme,
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            pty_close,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

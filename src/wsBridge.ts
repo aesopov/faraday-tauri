@@ -10,6 +10,9 @@ type Pending = {
   reject: (err: Error) => void;
 };
 
+type PtyDataCallback = (ptyId: number, data: string) => void;
+type PtyExitCallback = (ptyId: number) => void;
+
 const BINARY_HEADER_SIZE = 4; // uint32 LE requestId prefix on binary frames
 
 export async function createWsBridge(wsUrl: string): Promise<Bridge> {
@@ -19,6 +22,8 @@ export async function createWsBridge(wsUrl: string): Promise<Bridge> {
   let nextId = 0;
   const pending = new Map<number, Pending>();
   const changeListeners = new Set<(event: FsChangeEvent) => void>();
+  const ptyDataListeners = new Set<PtyDataCallback>();
+  const ptyExitListeners = new Set<PtyExitCallback>();
 
   const connected = new Promise<void>((resolve, reject) => {
     ws.addEventListener('open', () => resolve(), { once: true });
@@ -45,14 +50,20 @@ export async function createWsBridge(wsUrl: string): Promise<Bridge> {
   function handleText(text: string): void {
     const msg = JSON.parse(text);
 
-    // JSON-RPC notification (watch event)
-    if (!('id' in msg) && msg.method === 'fs.change') {
-      const event: FsChangeEvent = {
-        watchId: msg.params.watchId as string,
-        type: msg.params.type as FsChangeType,
-        name: (msg.params.name as string) ?? null,
-      };
-      for (const cb of changeListeners) cb(event);
+    // JSON-RPC notifications
+    if (!('id' in msg)) {
+      if (msg.method === 'fs.change') {
+        const event: FsChangeEvent = {
+          watchId: msg.params.watchId as string,
+          type: msg.params.type as FsChangeType,
+          name: (msg.params.name as string) ?? null,
+        };
+        for (const cb of changeListeners) cb(event);
+      } else if (msg.method === 'pty.data') {
+        for (const cb of ptyDataListeners) cb(msg.params.ptyId, msg.params.data);
+      } else if (msg.method === 'pty.exit') {
+        for (const cb of ptyExitListeners) cb(msg.params.ptyId);
+      }
       return;
     }
 
@@ -117,6 +128,22 @@ export async function createWsBridge(wsUrl: string): Promise<Bridge> {
         return () => {
           changeListeners.delete(callback);
         };
+      },
+    },
+    pty: {
+      spawn: (cwd: string) => rpc('pty.spawn', { cwd }) as Promise<number>,
+      write: (ptyId: number, data: string) =>
+        rpc('pty.write', { ptyId, data }) as Promise<void>,
+      resize: (ptyId: number, cols: number, rows: number) =>
+        rpc('pty.resize', { ptyId, cols: Math.floor(cols), rows: Math.floor(rows) }) as Promise<void>,
+      close: (ptyId: number) => rpc('pty.close', { ptyId }) as Promise<void>,
+      onData(callback: PtyDataCallback): () => void {
+        ptyDataListeners.add(callback);
+        return () => { ptyDataListeners.delete(callback); };
+      },
+      onExit(callback: PtyExitCallback): () => void {
+        ptyExitListeners.add(callback);
+        return () => { ptyExitListeners.delete(callback); };
       },
     },
     utils: {

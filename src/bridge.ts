@@ -16,6 +16,14 @@ export interface Bridge {
     unwatch(watchId: string): Promise<void>;
     onFsChange(callback: (event: FsChangeEvent) => void): () => void;
   };
+  pty: {
+    spawn(cwd: string): Promise<number>;
+    write(ptyId: number, data: string): Promise<void>;
+    resize(ptyId: number, cols: number, rows: number): Promise<void>;
+    close(ptyId: number): Promise<void>;
+    onData(callback: (ptyId: number, data: string) => void): () => void;
+    onExit(callback: (ptyId: number) => void): () => void;
+  };
   utils: {
     getHomePath(): Promise<string>;
     getIconsPath(): Promise<string>;

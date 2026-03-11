@@ -12,6 +12,7 @@ use axum::{
     routing::get,
     Router,
 };
+use crate::pty;
 use faraday_core::{
     error::FsError,
     ops::{self, FdTable},
@@ -20,7 +21,7 @@ use faraday_core::{
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -68,6 +69,8 @@ struct Session {
     fdt: FdTable,
     watcher: FsWatcher,
     icons_dir: Option<String>,
+    ptys: std::sync::Mutex<HashMap<u32, pty::PtyHandle>>,
+    next_pty_id: std::sync::atomic::AtomicU32,
 }
 
 // ── WebSocket handler ───────────────────────────────────────────────
@@ -102,6 +105,8 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
         fdt: FdTable::new(),
         watcher,
         icons_dir: state.icons_dir.as_ref().clone(),
+        ptys: std::sync::Mutex::new(HashMap::new()),
+        next_pty_id: std::sync::atomic::AtomicU32::new(0),
     });
 
     let write_task = tokio::spawn(async move {
@@ -122,7 +127,7 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
         let session = session.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Some(response) = process_message(&session, &text).await {
+            if let Some(response) = process_message(&session, &text, &tx).await {
                 let _ = tx.send(response);
             }
         });
@@ -134,7 +139,11 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 
 // ── RPC dispatch ────────────────────────────────────────────────────
 
-async fn process_message(session: &Arc<Session>, text: &str) -> Option<Message> {
+async fn process_message(
+    session: &Arc<Session>,
+    text: &str,
+    tx: &mpsc::UnboundedSender<Message>,
+) -> Option<Message> {
     let msg: Value = serde_json::from_str(text).ok()?;
     let id = msg.get("id")?.clone();
     let method = msg["method"].as_str()?.to_string();
@@ -163,6 +172,11 @@ async fn process_message(session: &Arc<Session>, text: &str) -> Option<Message> 
         });
     }
 
+    // PTY spawn needs tx for the reader thread
+    if method == "pty.spawn" {
+        return Some(handle_pty_spawn(session, &id, &params, tx));
+    }
+
     let session = session.clone();
     let result = tokio::task::spawn_blocking(move || dispatch(&session, &method, &params))
         .await
@@ -174,6 +188,69 @@ async fn process_message(session: &Arc<Session>, text: &str) -> Option<Message> 
         ),
         Err(e) => rpc_error(&id, &e),
     })
+}
+
+fn handle_pty_spawn(
+    session: &Arc<Session>,
+    id: &Value,
+    params: &Value,
+    tx: &mpsc::UnboundedSender<Message>,
+) -> Message {
+    let cwd = match params["cwd"].as_str() {
+        Some(s) => s,
+        None => return rpc_error(id, &FsError::InvalidInput),
+    };
+
+    let handle = match pty::spawn(cwd, 80, 24) {
+        Ok(h) => h,
+        Err(e) => return rpc_error(id, &FsError::Io(e)),
+    };
+
+    let pty_id = session
+        .next_pty_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    #[cfg(unix)]
+    let master_fd = handle.master_fd;
+
+    session.ptys.lock().unwrap().insert(pty_id, handle);
+
+    // Start reader thread that sends pty.data notifications
+    #[cfg(unix)]
+    {
+        let tx_pty = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pty::read_blocking(master_fd, &mut buf) {
+                    Ok(0) | Err(_) => {
+                        let n = json!({
+                            "jsonrpc": "2.0",
+                            "method": "pty.exit",
+                            "params": { "ptyId": pty_id }
+                        });
+                        let _ = tx_pty.send(Message::Text(n.to_string()));
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let msg = json!({
+                            "jsonrpc": "2.0",
+                            "method": "pty.data",
+                            "params": { "ptyId": pty_id, "data": data }
+                        });
+                        if tx_pty.send(Message::Text(msg.to_string())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    Message::Text(
+        json!({ "jsonrpc": "2.0", "id": id, "result": pty_id }).to_string(),
+    )
 }
 
 fn rpc_error(id: &Value, e: &FsError) -> Message {
@@ -219,6 +296,32 @@ fn dispatch(session: &Session, method: &str, params: &Value) -> Result<Value, Fs
         "fs.unwatch" => {
             let watch_id = params["watchId"].as_str().ok_or(FsError::InvalidInput)?;
             session.watcher.remove(watch_id);
+            Ok(Value::Null)
+        }
+        "pty.write" => {
+            let pty_id = params["ptyId"].as_u64().ok_or(FsError::InvalidInput)? as u32;
+            let data = params["data"].as_str().ok_or(FsError::InvalidInput)?;
+            let ptys = session.ptys.lock().unwrap();
+            let handle = ptys.get(&pty_id).ok_or(FsError::BadFd)?;
+            #[cfg(unix)]
+            pty::write_all(handle.master_fd, data.as_bytes()).map_err(FsError::Io)?;
+            Ok(Value::Null)
+        }
+        "pty.resize" => {
+            let pty_id = params["ptyId"].as_u64().ok_or(FsError::InvalidInput)? as u32;
+            let cols = params["cols"].as_u64().ok_or(FsError::InvalidInput)? as u16;
+            let rows = params["rows"].as_u64().ok_or(FsError::InvalidInput)? as u16;
+            let ptys = session.ptys.lock().unwrap();
+            let handle = ptys.get(&pty_id).ok_or(FsError::BadFd)?;
+            #[cfg(unix)]
+            pty::resize(handle.master_fd, cols, rows).map_err(FsError::Io)?;
+            Ok(Value::Null)
+        }
+        "pty.close" => {
+            let pty_id = params["ptyId"].as_u64().ok_or(FsError::InvalidInput)? as u32;
+            if let Some(mut handle) = session.ptys.lock().unwrap().remove(&pty_id) {
+                pty::close(&mut handle);
+            }
             Ok(Value::Null)
         }
         "utils.getHomePath" => Ok(json!(

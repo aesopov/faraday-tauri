@@ -78,6 +78,34 @@ export const tauriBridge = {
       return () => { unlisten?.(); };
     },
   },
+  pty: {
+    async spawn(cwd: string): Promise<number> {
+      return invoke<number>('pty_spawn', { cwd });
+    },
+    async write(ptyId: number, data: string): Promise<void> {
+      return invoke<void>('pty_write', { ptyId, data });
+    },
+    async resize(ptyId: number, cols: number, rows: number): Promise<void> {
+      return invoke<void>('pty_resize', { ptyId, cols: Math.floor(cols), rows: Math.floor(rows) });
+    },
+    async close(ptyId: number): Promise<void> {
+      return invoke<void>('pty_close', { ptyId });
+    },
+    onData(callback: (ptyId: number, data: string) => void): () => void {
+      let unlisten: UnlistenFn | null = null;
+      listen<{ pty_id: number; data: string }>('pty:data', (event) => {
+        callback(event.payload.pty_id, event.payload.data);
+      }).then((fn) => { unlisten = fn; });
+      return () => { unlisten?.(); };
+    },
+    onExit(callback: (ptyId: number) => void): () => void {
+      let unlisten: UnlistenFn | null = null;
+      listen<{ pty_id: number }>('pty:exit', (event) => {
+        callback(event.payload.pty_id);
+      }).then((fn) => { unlisten = fn; });
+      return () => { unlisten?.(); };
+    },
+  },
   utils: {
     async getHomePath(): Promise<string> {
       return invoke<string>('get_home_path');

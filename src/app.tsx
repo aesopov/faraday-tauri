@@ -10,6 +10,7 @@ import { FileList } from './FileList';
 import { FileViewer } from './FileViewer';
 import { ImageViewer, isImageFile } from './ImageViewer';
 import { ModalDialog, type ModalDialogProps } from './ModalDialog';
+import { TerminalPanel } from './Terminal';
 import { DirectoryHandle, FileSystemObserver, type FileSystemChangeRecord, type HandleMeta } from './fsa';
 import { createPanelResolver, invalidateFssCache, syncLayers } from './fss';
 import { basename, dirname, join } from './path';
@@ -308,6 +309,8 @@ export function App() {
     return <div className="loading">Loading...</div>;
   }
 
+  const activeCwd = activePanel === 'left' ? left.currentPath : right.currentPath;
+
   return (
     <div className="app">
       <div className="panels">
@@ -335,6 +338,9 @@ export function App() {
             resolver={right.resolver}
           />
         </div>
+      </div>
+      <div className="terminal-panel">
+        <TerminalPanel cwd={activeCwd} />
       </div>
       {viewerFile &&
         (isImageFile(viewerFile.name) ? (

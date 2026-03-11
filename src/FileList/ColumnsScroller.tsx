@@ -102,7 +102,7 @@ export const ColumnsScroller = memo(function ColumnsScroller(props: ColumnsScrol
           style={{ columnCount, height: itemsPerColumn * itemHeight }}
         >
           {/* Workaround for Chrome macOS column layout bug */}
-          <div style={{ height: 0.1, overflow: 'hidden' }} />
+          {/* <div style={{ height: 0.1, overflow: 'hidden' }} /> */}
           {items}
         </div>
       </ScrollableContainer>

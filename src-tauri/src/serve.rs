@@ -1,7 +1,7 @@
-// Headless Faraday server — HTTP static files + WebSocket FS over JSON-RPC 2.0.
-//
-// Uses faraday-core for all filesystem operations (same as the Tauri app).
-// Each WebSocket connection gets its own FdTable and FsWatcher.
+/// `faraday serve` — headless HTTP + WebSocket server.
+///
+/// Serves static web UI files and exposes filesystem operations via
+/// JSON-RPC 2.0 over WebSocket. Uses faraday-core for all FS ops.
 
 use axum::{
     extract::{
@@ -58,7 +58,7 @@ impl From<ops::EntryInfo> for JsEntry {
 // ── Shared server config ────────────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState {
+struct ServerState {
     icons_dir: Arc<Option<String>>,
 }
 
@@ -72,15 +72,17 @@ struct Session {
 
 // ── WebSocket handler ───────────────────────────────────────────────
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: ServerState) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-    // Per-connection watch callback → JSON-RPC notifications
     let tx_watch = tx.clone();
     let cb: EventCallback = Arc::new(move |watch_id, kind, name| {
         let n = json!({
@@ -102,7 +104,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         icons_dir: state.icons_dir.as_ref().clone(),
     });
 
-    // Writer: channel → WebSocket
     let write_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sink.send(msg).await.is_err() {
@@ -111,7 +112,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    // Reader: WebSocket → dispatch
     while let Some(Ok(msg)) = stream.next().await {
         let text = match msg {
             Message::Text(t) => t,
@@ -130,7 +130,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     drop(tx);
     let _ = write_task.await;
-    // Session drops here → FdTable closes all fds, FsWatcher stops
 }
 
 // ── RPC dispatch ────────────────────────────────────────────────────
@@ -141,7 +140,6 @@ async fn process_message(session: &Arc<Session>, text: &str) -> Option<Message> 
     let method = msg["method"].as_str()?.to_string();
     let params = msg["params"].clone();
 
-    // fs.read → binary frame response
     if method == "fs.read" {
         let fd = params["handle"].as_i64()? as i32;
         let offset = params["offset"].as_u64()?;
@@ -233,7 +231,7 @@ fn dispatch(session: &Session, method: &str, params: &Value) -> Result<Value, Fs
     }
 }
 
-// ── CLI config ──────────────────────────────────────────────────────
+// ── Config parsing ──────────────────────────────────────────────────
 
 struct Config {
     port: u16,
@@ -242,8 +240,7 @@ struct Config {
     icons_dir: Option<String>,
 }
 
-fn parse_config() -> Config {
-    let args: Vec<String> = std::env::args().collect();
+fn parse_config(args: &[String]) -> Config {
     let mut port: u16 = std::env::var("FARADAY_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -252,7 +249,7 @@ fn parse_config() -> Config {
     let mut static_dir: Option<String> = None;
     let mut icons_dir: Option<String> = None;
 
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--port" if i + 1 < args.len() => {
@@ -280,7 +277,6 @@ fn parse_config() -> Config {
         }
     }
 
-    // Auto-detect static dir
     if static_dir.is_none() {
         for c in ["dist-web", "../dist-web"] {
             if PathBuf::from(c).join("index.html").exists() {
@@ -290,7 +286,6 @@ fn parse_config() -> Config {
         }
     }
 
-    // Auto-detect icons dir
     if icons_dir.is_none() {
         for c in ["src-tauri/icons-bundle", "icons-bundle", "icons"] {
             if PathBuf::from(c).exists() {
@@ -310,37 +305,41 @@ fn parse_config() -> Config {
     }
 }
 
-// ── Main ────────────────────────────────────────────────────────────
+// ── Entry point ─────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
-    let config = parse_config();
-    let state = AppState {
-        icons_dir: Arc::new(config.icons_dir),
-    };
+/// Run the headless HTTP + WebSocket server.
+/// `args` are the arguments after the `serve` subcommand.
+pub fn run(args: &[String]) {
+    let config = parse_config(args);
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        let state = ServerState {
+            icons_dir: Arc::new(config.icons_dir),
+        };
 
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(state);
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state);
 
-    let app = if let Some(ref dir) = config.static_dir {
-        let index = PathBuf::from(dir).join("index.html");
-        if index.exists() {
-            eprintln!("Serving web UI from {dir}");
-            app.fallback_service(
-                ServeDir::new(dir).not_found_service(ServeFile::new(index)),
-            )
+        let app = if let Some(ref dir) = config.static_dir {
+            let index = PathBuf::from(dir).join("index.html");
+            if index.exists() {
+                eprintln!("Serving web UI from {dir}");
+                app.fallback_service(
+                    ServeDir::new(dir).not_found_service(ServeFile::new(index)),
+                )
+            } else {
+                app
+            }
         } else {
             app
-        }
-    } else {
-        app
-    };
+        };
 
-    let addr = format!("{}:{}", config.host, config.port);
-    eprintln!("Faraday server listening on http://{addr}");
-    eprintln!("WebSocket endpoint: ws://{addr}/ws");
+        let addr = format!("{}:{}", config.host, config.port);
+        eprintln!("Faraday server listening on http://{addr}");
+        eprintln!("WebSocket endpoint: ws://{addr}/ws");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
 }

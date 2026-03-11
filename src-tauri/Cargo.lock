@@ -1004,30 +1004,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "faraday-server"
+name = "faraday-tauri"
 version = "0.1.0"
 dependencies = [
  "axum",
  "dirs",
  "faraday-core",
  "futures",
- "serde",
- "serde_json",
- "tokio",
- "tower-http 0.5.2",
-]
-
-[[package]]
-name = "faraday-tauri"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "faraday-core",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
+ "tower-http 0.5.2",
 ]
 
 [[package]]
@@ -1134,14 +1125,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "frdye"
-version = "0.1.0"
-dependencies = [
- "faraday-core",
- "libc",
 ]
 
 [[package]]

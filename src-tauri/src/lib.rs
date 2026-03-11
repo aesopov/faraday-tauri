@@ -11,6 +11,9 @@ mod elevate;
 #[path = "elevate_stub.rs"]
 mod elevate;
 
+pub mod rpc;
+pub mod serve;
+
 // ── Serializable types for Tauri IPC ─────────────────────────────────
 
 #[derive(Serialize, Clone)]

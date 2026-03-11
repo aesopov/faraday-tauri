@@ -182,11 +182,12 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Find frdye binary — look next to the current executable (both dev and bundle).
+/// The helper is ourselves — `faraday rpc`.
 fn helper_path() -> String {
-    let exe = std::env::current_exe().expect("cannot determine current exe path");
-    let exe_dir = exe.parent().expect("exe has no parent dir");
-    exe_dir.join("frdye").to_string_lossy().into_owned()
+    std::env::current_exe()
+        .expect("cannot determine current exe path")
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn launch_elevated(watch_callback: WatchCallback) -> Result<Arc<FsProxy>, FsError> {
@@ -207,8 +208,9 @@ pub fn launch_elevated(watch_callback: WatchCallback) -> Result<Arc<FsProxy>, Fs
         let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    // Spawn elevated helper
+    // Spawn elevated helper (ourselves with "rpc" subcommand)
     let args = vec![
+        "rpc".to_string(),
         "--socket".to_string(),
         sock_path.clone(),
         "--token".to_string(),

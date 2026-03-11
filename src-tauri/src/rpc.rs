@@ -1,16 +1,23 @@
-/// frdye — lightweight elevated filesystem helper.
+/// `faraday rpc` — elevated filesystem helper.
 ///
 /// Speaks a length-prefixed binary protocol over a Unix domain socket (macOS/Linux)
-/// or a named pipe (Windows).
-use faraday_core::error::FsError;
-use faraday_core::ops::{self, FdTable};
-use faraday_core::proto::{self, EventType, Method, MsgReader, MsgType, Reader, Writer};
-use faraday_core::watch::{EventKind, FsWatcher};
-use std::io::{self, Read, Write as IoWrite};
-use std::sync::Arc;
+/// or a named pipe (Windows). Used internally when the main app needs elevated
+/// filesystem access.
 
 #[cfg(unix)]
+use faraday_core::error::FsError;
+#[cfg(unix)]
+use faraday_core::ops::{self, FdTable};
+#[cfg(unix)]
+use faraday_core::proto::{self, EventType, Method, MsgReader, MsgType, Reader, Writer};
+#[cfg(unix)]
+use faraday_core::watch::{EventKind, FsWatcher};
+#[cfg(unix)]
+use std::io::{Read, Write as IoWrite};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::sync::Arc;
 
 // ── Argument parsing ─────────────────────────────────────────────────
 
@@ -19,11 +26,10 @@ struct Args {
     token: String,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let args: Vec<String> = std::env::args().collect();
+fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut socket_path = None;
     let mut token = None;
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--socket" => {
@@ -44,44 +50,41 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-// ── Connection ───────────────────────────────────────────────────────
-
-#[cfg(unix)]
-fn connect(path: &str) -> io::Result<UnixStream> {
-    UnixStream::connect(path)
-}
-
 // ── Protocol helpers ─────────────────────────────────────────────────
 
-fn send_auth(stream: &mut impl IoWrite, token: &str) -> io::Result<()> {
+#[cfg(unix)]
+fn send_auth(stream: &mut impl IoWrite, token: &str) -> std::io::Result<()> {
     let mut w = Writer::new();
     w.u8(MsgType::Auth as u8).raw(token.as_bytes());
     proto::write_msg(stream, w.as_slice())
 }
 
-fn send_response(stream: &mut impl IoWrite, id: u32, payload: &[u8]) -> io::Result<()> {
+#[cfg(unix)]
+fn send_response(stream: &mut impl IoWrite, id: u32, payload: &[u8]) -> std::io::Result<()> {
     let mut w = Writer::new();
     w.u8(MsgType::Response as u8).u32(id).raw(payload);
     proto::write_msg(stream, w.as_slice())
 }
 
+#[cfg(unix)]
 fn send_error(
     stream: &mut impl IoWrite,
     id: u32,
     code: &str,
     message: &str,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     let mut w = Writer::new();
     w.u8(MsgType::Error as u8).u32(id).str(code).str(message);
     proto::write_msg(stream, w.as_slice())
 }
 
+#[cfg(unix)]
 fn send_event(
     stream: &mut impl IoWrite,
     watch_id: &str,
     kind: EventType,
     name: Option<&str>,
-) -> io::Result<()> {
+) -> std::io::Result<()> {
     let mut w = Writer::new();
     w.u8(MsgType::Event as u8).str(watch_id).u8(kind as u8);
     if let Some(n) = name {
@@ -94,6 +97,7 @@ fn send_event(
 
 // ── Request dispatch ─────────────────────────────────────────────────
 
+#[cfg(unix)]
 fn dispatch(
     method: Method,
     reader: &mut Reader<'_>,
@@ -195,14 +199,16 @@ fn handle_request(
     }
 }
 
-// ── Main ─────────────────────────────────────────────────────────────
+// ── Entry point ─────────────────────────────────────────────────────
 
+/// Run the elevated RPC helper.
+/// `args` are the arguments after the `rpc` subcommand.
 #[cfg(unix)]
-fn main() {
-    let args = match parse_args() {
+pub fn run(args: &[String]) {
+    let parsed = match parse_args(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("Usage: frdye --socket <path> --token <hex>\n{e}");
+            eprintln!("Usage: faraday rpc --socket <path> --token <hex>\n{e}");
             std::process::exit(1);
         }
     };
@@ -222,7 +228,7 @@ fn main() {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
     }
 
-    let mut sock = match connect(&args.socket_path) {
+    let mut sock = match UnixStream::connect(&parsed.socket_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("connect failed: {e}");
@@ -230,7 +236,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = send_auth(&mut sock, &args.token) {
+    if let Err(e) = send_auth(&mut sock, &parsed.token) {
         eprintln!("auth failed: {e}");
         std::process::exit(1);
     }
@@ -238,7 +244,6 @@ fn main() {
     let fdt = FdTable::new();
 
     // Set up watch event callback that sends events over the socket.
-    // Clone the socket fd for the callback thread.
     let event_sock = sock.try_clone().expect("failed to clone socket");
     let event_sock = Arc::new(std::sync::Mutex::new(event_sock));
 
@@ -255,20 +260,7 @@ fn main() {
     }))
     .expect("failed to create watcher");
 
-    // macOS: monitor parent process via kqueue
-    #[cfg(target_os = "macos")]
-    {
-        // The notify crate handles FSEvents; parent death is detected
-        // when the socket read returns EOF/error.
-    }
-
     let mut msg_reader = MsgReader::new();
-
-    // Unix poll loop
-    let _sock_fd = {
-        use std::os::unix::io::AsRawFd;
-        sock.as_raw_fd()
-    };
 
     sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
         .ok();
@@ -286,9 +278,9 @@ fn main() {
                 }
             }
             Err(ref e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut
-                    || e.kind() == io::ErrorKind::Interrupted =>
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 // Timeout or signal — just continue polling
             }
@@ -298,8 +290,7 @@ fn main() {
 }
 
 #[cfg(not(unix))]
-fn main() {
-    // Windows named pipe support will be added in a future phase.
-    eprintln!("frdye: Windows support not yet implemented");
+pub fn run(_args: &[String]) {
+    eprintln!("faraday rpc: Windows named pipe support not yet implemented");
     std::process::exit(1);
 }

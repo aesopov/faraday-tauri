@@ -6,14 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:frdye": "cd src-tauri && cargo build -p frdye",
-    "build:frdye:release": "cd src-tauri && cargo build -p frdye --release",
     "preview": "vite preview",
     "tauri": "tauri",
     "build:web": "vite build --config vite.web.config.ts",
     "dev:web": "vite dev --config vite.web.config.ts",
-    "build:server": "cd src-tauri && cargo build -p faraday-server --release",
-    "build:server:dev": "cd src-tauri && cargo build -p faraday-server"
+    "build:rust": "cd src-tauri && cargo build --release",
+    "build:rust:dev": "cd src-tauri && cargo build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
